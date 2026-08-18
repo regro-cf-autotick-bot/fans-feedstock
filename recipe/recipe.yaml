@@ -1,92 +1,159 @@
 context:
-  version: "0.7.0"
+  version: "0.8.1"
+  # abi3 floor; must match requires-python in pyfans/pyproject.toml
+  python_min: "3.12"
 
-package:
+recipe:
   name: fans
   version: ${{ version }}
 
 source:
   url: https://github.com/DataAnalyticsEngineering/FANS/archive/refs/tags/v${{ version }}.tar.gz
-  sha256: 085e1a330125d05b890be4067eab16f22420e35370f2a12c886c9d7c8f089dd3
+  sha256: 6d0063ba38ddac9d9f7f18d920a509a2d4496bf9afaf1cd9fb7088ceaf11e23d
 
 build:
-  number: 1
+  number: 0
   skip:
     - win
-  script:
-    - if: unix
-      then:
+
+outputs:
+  # The solver: binary, library, headers and cmake package. No Python.
+  - package:
+      name: fans
+    build:
+      script:
+        - if: unix
+          then:
+            - if: (build_platform != target_platform)
+              then:
+                # flags from https://conda-forge.org/docs/maintainer/knowledge_base/#cross-compilation and https://github.com/conda-forge/mumps-feedstock/blob/966474677d28486ef897b0d3bb2c10558dc9b5ca/recipe/build-mumps.sh
+                - export OMPI_CC=$CC
+                - export OMPI_CXX=$CXX
+                - export OMPI_FC=$FC
+                - export OPAL_PREFIX="$PREFIX"
+                - export FFLAGS="${FFLAGS} -DAVOID_MPI_IN_PLACE"
+                - export LDFLAGS="${LDFLAGS} -headerpad_max_install_names"
+                - |
+                  # Filter out host-only CPU flags safely
+                  for var in CFLAGS CXXFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS; do
+                    val="${!var}"
+                    # Remove -march=nocona and -mtune=haswell as whole tokens
+                    val="$(echo "$val" | sed -E 's/(^|[[:space:]])-march=nocona([[:space:]]|$)/ /g; s/(^|[[:space:]])-mtune=haswell([[:space:]]|$)/ /g')"
+                    # Normalize spacing (trim and collapse multiple spaces)
+                    val="$(echo "$val" | tr -s ' ' | sed -E 's/^ //; s/ $//')"
+                    export "$var=$val"
+                  done
+                  for var in CFLAGS CXXFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS; do
+                    echo "$var cleaned: '${!var}'"
+                  done
+            - cmake -S . -B build $CMAKE_ARGS
+            - cmake --build build -j
+            - cmake --install build
+    requirements:
+      build:
+        - ${{ compiler('c') }}
+        - ${{ compiler('cxx') }}
+        - ${{ stdlib('c') }}
+        - cmake
+        - make
+        - ninja
         - if: (build_platform != target_platform)
           then:
-            # flags from https://conda-forge.org/docs/maintainer/knowledge_base/#cross-compilation and https://github.com/conda-forge/mumps-feedstock/blob/966474677d28486ef897b0d3bb2c10558dc9b5ca/recipe/build-mumps.sh
+            - openmpi-mpicxx
+      host:
+        # Pinned to 1.14 deliberately: unpinned resolves to hdf5 2.1, and every
+        # conda-forge fenics-dolfinx pins 1.14, so pyfans could not share an
+        # environment with the Micro Manager's macro side.
+        - hdf5 >=1.14,<2 mpi_openmpi*
+        - fftw * mpi_openmpi*
+        - openmpi-mpicxx
+        - eigen
+        - nlohmann_json
+        - spdlog
+    tests:
+      - package_contents:
+          bin:
+            - FANS
+          lib:
+            - FANS
+      - script:
+          # JSON test file has relative path to h5 included - changing that
+          - JSON_FILE="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/input_files/test_LinearElastic.json"
+          - MODIFIED_JSON_FILE="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/input_files/test_LinearElastic_mod.json"
+          - NEW_MS_FILENAME="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/microstructures/sphere32.h5"
+          # Use jq to create a modified copy of the JSON file
+          - jq --arg new_filename "$NEW_MS_FILENAME" '.microstructure.filepath = $new_filename' "$JSON_FILE" > "$MODIFIED_JSON_FILE"
+          # Run tests
+          - mpiexec -n 1 FANS "$MODIFIED_JSON_FILE" "$PREFIX/etc/conda/test-files/$PKG_NAME/0//test/test_results.h5"
+        requirements:
+          run:
+            - jq
+        files:
+          source:
+            - test/
+      - script:
+          - FANS --version
+
+  # The nanobind bindings, built against the `fans` package above rather than
+  # rebuilding the solver. One abi3 build serves every supported Python.
+  - package:
+      name: pyfans
+    build:
+      # One abi3 build serves every Python from python_min up, so build it once
+      # rather than once per Python in the variant matrix.
+      skip:
+        - match(python, "!=" + python_min)
+      python:
+        version_independent: true
+      script:
+        - if: (build_platform != target_platform)
+          then:
+            # Same MPI wrapper setup and host-flag scrubbing the fans output
+            # needs when cross compiling.
             - export OMPI_CC=$CC
             - export OMPI_CXX=$CXX
-            - export OMPI_FC=$FC
             - export OPAL_PREFIX="$PREFIX"
-            - export FFLAGS="${FFLAGS} -DAVOID_MPI_IN_PLACE"
-            - export LDFLAGS="${LDFLAGS} -headerpad_max_install_names"
             - |
-              # Filter out host-only CPU flags safely
               for var in CFLAGS CXXFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS; do
                 val="${!var}"
-                # Remove -march=nocona and -mtune=haswell as whole tokens
                 val="$(echo "$val" | sed -E 's/(^|[[:space:]])-march=nocona([[:space:]]|$)/ /g; s/(^|[[:space:]])-mtune=haswell([[:space:]]|$)/ /g')"
-                # Normalize spacing (trim and collapse multiple spaces)
                 val="$(echo "$val" | tr -s ' ' | sed -E 's/^ //; s/ $//')"
                 export "$var=$val"
               done
-              for var in CFLAGS CXXFLAGS DEBUG_CFLAGS DEBUG_CXXFLAGS; do
-                echo "$var cleaned: '${!var}'"
-              done
-        - mkdir build
-        - cd build
-        - cmake .. $CMAKE_ARGS -DFANS_LIBRARY_FOR_MICRO_MANAGER=ON
-        - cmake --build . -j
-        - cmake --install .
-
-requirements:
-  build:
-    - ${{ compiler('c') }}
-    - ${{ compiler('cxx') }}
-    - ${{ stdlib('c') }}
-    - cmake
-    - make
-    - ninja
-    - pybind11
-    - if: (build_platform != target_platform)
-      then:
-        - openmpi-mpicxx
-  host:
-    - hdf5 * mpi_openmpi*
-    - fftw * mpi_openmpi*
-    - openmpi-mpicxx
-    - eigen
-    - nlohmann_json
-    - spdlog
-
-tests:
-  - package_contents:
-      bin:
-        - FANS
-      lib:
-        - FANS
-  - script:
-      # JSON test file has relative path to h5 included - changing that
-      - JSON_FILE="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/input_files/test_LinearElastic.json"
-      - MODIFIED_JSON_FILE="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/input_files/test_LinearElastic_mod.json"
-      - NEW_MS_FILENAME="$PREFIX/etc/conda/test-files/$PKG_NAME/0/test/microstructures/sphere32.h5"
-      # Use jq to create a modified copy of the JSON file
-      - jq --arg new_filename "$NEW_MS_FILENAME" '.microstructure.filepath = $new_filename' "$JSON_FILE" > "$MODIFIED_JSON_FILE"
-      # Run tests
-      - mpiexec -n 1 FANS "$MODIFIED_JSON_FILE" "$PREFIX/etc/conda/test-files/$PKG_NAME/0//test/test_results.h5"
+        - ${{ PYTHON }} -m pip install ./pyfans -vv --no-deps --no-build-isolation
     requirements:
+      build:
+        - ${{ compiler('c') }}
+        - ${{ compiler('cxx') }}
+        - ${{ stdlib('c') }}
+        - cmake
+        - make
+        - ninja
+        - if: (build_platform != target_platform)
+          then:
+            - openmpi-mpicxx
+            - python
+            - cross-python_${{ target_platform }}
+      host:
+        - python
+        - pip
+        - scikit-build-core
+        - nanobind
+        - ${{ pin_subpackage('fans', exact=True) }}
+        # FANSConfig.cmake re-resolves these through find_dependency.
+        - hdf5 >=1.14,<2 mpi_openmpi*
+        - fftw * mpi_openmpi*
+        - openmpi-mpicxx
+        - eigen
+        - nlohmann_json
+        - spdlog
       run:
-        - jq
-    files:
-      source:
-        - test/
-  - script:
-      - FANS --version
+        - python
+        - ${{ pin_subpackage('fans', exact=True) }}
+    tests:
+      - python:
+          imports:
+            - PyFANS
 
 about:
   homepage: https://github.com/DataAnalyticsEngineering/FANS
@@ -94,7 +161,8 @@ about:
   description: |
     Fourier-Accelerated Nodal Solver (FANS) is an FFT-based homogenization solver for microscale multiphysics problems.
     FANS is written in C++, built using CMake, and it has MPI parallelization.
-    The package exposes the binary FANS and the Python-bindings via libFANS.
+    The `fans` package provides the FANS binary and the libFANS library; the
+    `pyfans` package provides the Python bindings used by the preCICE Micro Manager.
   license: LGPL-3.0-only
   license_family: LGPL
   license_file: LICENSE
